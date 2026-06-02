@@ -85,3 +85,12 @@ PROVIDE(_trap_exit = 0x02000300);
 
 /* SoC register symbols */
 PROVIDE(corestatus = 0x03000008);
+
+/* Stack overflow guard --------------------------------------------------- */
+/* The linker does NOT model the descending stack, so an image that links and
+ * loads fine can still corrupt its own .rodata/.data at runtime once the stack
+ * grows down into it (silent failure: zeroed weights, garbled UART). Reserve a
+ * stack budget and fail the LINK loudly if image + stack won't fit the 4K SRAM. */
+_stack_size = 256;
+ASSERT(ORIGIN(SRAM) + LENGTH(SRAM) - _stack_size >= ADDR(.misc) + SIZEOF(.misc),
+       "ERROR: program image + reserved stack exceeds 4K SRAM");

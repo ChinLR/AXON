@@ -1,11 +1,30 @@
+// Copyright (c) 2026 ETH Zurich.
+// Licensed under Solderpad Hardware License 0.51.
+//
+// test3.c — 8 -> 4 -> 2 INT8 MLP, software vs. MAC-hardware, side by side.
+//
+// Trimmed for the 4K on-chip SRAM (2 banks x 512 x 32b = 4096 B): no printf
+// (keeps the stack shallow + cuts format-string rodata), one print_vec helper.
+//
+// Uses the single-transaction MAC unit: one OBI write per term carries both
+// operands and triggers acc += A*B. No multi-write operand/trigger skew, so
+// the back-to-back inner loop is correct without any SW barriers.
+//
+// Expected: h=[0,3,0,3], out=[6,-6] for BOTH paths.
+
 #include <stdint.h>
 #include "uart.h"
-#include "print.h"
 
+// --- cycle counter --------------------------------------------------------
 static inline uint32_t read_mcycle(void) {
     uint32_t v;
     asm volatile("csrr %0, mcycle" : "=r"(v));
     return v;
+}
+
+// --- tiny output helpers (uart_write only, no printf) ---------------------
+static void print_str(const char *s) {
+    while (*s) uart_write((uint8_t)*s++);
 }
 
 static void print_int(int32_t v) {
@@ -14,36 +33,41 @@ static void print_int(int32_t v) {
     char buf[12];
     int n = 0;
     while (v > 0) { buf[n++] = (char)('0' + (v % 10)); v /= 10; }
-    while (n--) uart_write(buf[n]);
+    while (n--) uart_write((uint8_t)buf[n]);
 }
 
-// ---------------------------------------------------------------------------
-// MAC unit register map
-// ---------------------------------------------------------------------------
-#define MAC_BASE_ADDR     (0x20000000UL)
-#define MAC_OPERAND_A (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x00)))
-#define MAC_OPERAND_B (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x04)))
-#define MAC_CONTROL   (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x08)))
-#define MAC_RESULT    (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x0C)))
+static void print_vec(const char *label, const int8_t *v, int n) {
+    print_str(label);
+    uart_write('[');
+    for (int i = 0; i < n; i++) {
+        if (i) uart_write(',');
+        print_int(v[i]);
+    }
+    uart_write(']');
+    uart_write('\n');
+}
 
-#define MAC_CTRL_ACCUMULATE (1u << 0)
-#define MAC_CTRL_CLEAR      (1u << 1)
+// --- MAC unit register map (user domain base = 0x2000_0000) ---------------
+//   0x00 MAC   [W] : wdata[7:0]=A(signed), wdata[15:8]=B(signed) -> acc += A*B
+//   0x04 CLEAR [W] : any write clears the accumulator
+//   0x08 RESULT[R] : 32-bit signed accumulator
+#define MAC_BASE_ADDR (0x20000000UL)
+#define MAC_DO     (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x00)))
+#define MAC_CLEAR  (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x04)))
+#define MAC_RESULT (*((volatile int32_t  *)(MAC_BASE_ADDR + 0x08)))
 
 static inline void mac_clear(void) {
-    MAC_CONTROL = MAC_CTRL_CLEAR;
+    MAC_CLEAR = 0;
 }
 static inline void mac_accumulate(int8_t a, int8_t b) {
-    MAC_OPERAND_A = (uint32_t)(int32_t)a;
-    MAC_OPERAND_B = (uint32_t)(int32_t)b;
-    MAC_CONTROL   = MAC_CTRL_ACCUMULATE;
+    // pack {B, A} into one word: low byte = A, next byte = B
+    MAC_DO = (uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8);
 }
 static inline int32_t mac_read_result(void) {
     return (int32_t)MAC_RESULT;
 }
 
-// ---------------------------------------------------------------------------
-// Network
-// ---------------------------------------------------------------------------
+// --- network --------------------------------------------------------------
 #define DIM_IN   8
 #define DIM_H    4
 #define DIM_OUT  2
@@ -78,9 +102,7 @@ static int8_t saturate_requantize(int32_t acc, int shift) {
     return (int8_t)acc;
 }
 
-// ---------------------------------------------------------------------------
-// SW forward pass
-// ---------------------------------------------------------------------------
+// --- SW forward pass (core does the MACs) ---------------------------------
 static void mlp_sw(int8_t *h, int8_t *y) {
     for (int o = 0; o < DIM_H; ++o) {
         int32_t acc = 0;
@@ -96,9 +118,7 @@ static void mlp_sw(int8_t *h, int8_t *y) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// HW forward pass
-// ---------------------------------------------------------------------------
+// --- HW forward pass (MAC unit does the accumulate; ReLU/sat in SW) -------
 static void mlp_hw(int8_t *h, int8_t *y) {
     for (int o = 0; o < DIM_H; ++o) {
         mac_clear();
@@ -114,63 +134,43 @@ static void mlp_hw(int8_t *h, int8_t *y) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
+// --- main -----------------------------------------------------------------
 int main(void) {
     uart_init();
 
     int8_t h_sw[DIM_H], y_sw[DIM_OUT];
     int8_t h_hw[DIM_H], y_hw[DIM_OUT];
 
-    // --- SW run ---
+    // SW run
     uint32_t t0 = read_mcycle();
     mlp_sw(h_sw, y_sw);
     uint32_t cycles_sw = read_mcycle() - t0;
 
-    printf("SW h=[");
-    print_int(h_sw[0]); printf(",");
-    print_int(h_sw[1]); printf(",");
-    print_int(h_sw[2]); printf(",");
-    print_int(h_sw[3]); printf("]\n");
-    printf("SW out=[");
-    print_int(y_sw[0]); printf(",");
-    print_int(y_sw[1]); printf("]\n");
-    printf("SW cycles=");
-    print_int((int32_t)cycles_sw); printf("\n");
+    print_vec("SW h=", h_sw, DIM_H);
+    print_vec("SW y=", y_sw, DIM_OUT);
+    print_str("SW cyc="); print_int((int32_t)cycles_sw); uart_write('\n');
 
-    // --- HW run ---
+    // HW run
     uint32_t t1 = read_mcycle();
     mlp_hw(h_hw, y_hw);
     uint32_t cycles_hw = read_mcycle() - t1;
 
-    printf("HW h=[");
-    print_int(h_hw[0]); printf(",");
-    print_int(h_hw[1]); printf(",");
-    print_int(h_hw[2]); printf(",");
-    print_int(h_hw[3]); printf("]\n");
-    printf("HW out=[");
-    print_int(y_hw[0]); printf(",");
-    print_int(y_hw[1]); printf("]\n");
-    printf("HW cycles=");
-    print_int((int32_t)cycles_hw); printf("\n");
+    print_vec("HW h=", h_hw, DIM_H);
+    print_vec("HW y=", y_hw, DIM_OUT);
+    print_str("HW cyc="); print_int((int32_t)cycles_hw); uart_write('\n');
 
-    // --- Comparison ---
-    printf("SW="); print_int((int32_t)cycles_sw);
-    printf(" HW="); print_int((int32_t)cycles_hw);
+    // cycle comparison (reported, not gated)
     if (cycles_hw < cycles_sw) {
-        printf(" MAC faster by ");
-        print_int((int32_t)(cycles_sw - cycles_hw));
+        print_str("MAC faster by "); print_int((int32_t)(cycles_sw - cycles_hw));
     } else {
-        printf(" Core faster by ");
-        print_int((int32_t)(cycles_hw - cycles_sw));
+        print_str("Core faster by "); print_int((int32_t)(cycles_hw - cycles_sw));
     }
-    printf(" cycles\n");
+    print_str(" cyc\n");
 
-    // --- PASS/FAIL: correctness only, not speed ---
+    // PASS/FAIL: correctness of both paths only
     int sw_pass = (y_sw[0] == 6 && y_sw[1] == -6);
     int hw_pass = (y_hw[0] == 6 && y_hw[1] == -6);
-    printf(sw_pass && hw_pass ? "PASS\n" : "FAIL\n");
+    print_str((sw_pass && hw_pass) ? "PASS\n" : "FAIL\n");
 
     uart_write_flush();
     return (sw_pass && hw_pass) ? 0 : 1;

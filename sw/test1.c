@@ -20,29 +20,28 @@ static void print_int(int32_t v) {
     char buf[12];
     int n = 0;
     while (v > 0) { buf[n++] = (char)('0' + (v % 10)); v /= 10; }
-    while (n--) uart_write(buf[n]);
+    while (n--) uart_write((uint8_t)buf[n]);
 }
 
 // ---------------------------------------------------------------------------
 // MAC unit register map (user domain base = 0x2000_0000)
+// Single-transaction MAC: one write carries both operands AND the accumulate.
+//   0x00 MAC   [W] : wdata[7:0]=A(signed), wdata[15:8]=B(signed) -> acc += A*B
+//   0x04 CLEAR [W] : any write clears the accumulator
+//   0x08 RESULT[R] : 32-bit signed accumulator
 // ---------------------------------------------------------------------------
-#define MAC_BASE_ADDR      (0x20000000UL)
-#define MAC_OPERAND_A  (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x00)))
-#define MAC_OPERAND_B  (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x04)))
-#define MAC_CONTROL    (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x08)))
-#define MAC_RESULT     (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x0C)))
-
-#define MAC_CTRL_ACCUMULATE (1u << 0)
-#define MAC_CTRL_CLEAR      (1u << 1)
+#define MAC_BASE_ADDR (0x20000000UL)
+#define MAC_DO     (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x00)))
+#define MAC_CLEAR  (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x04)))
+#define MAC_RESULT (*((volatile int32_t  *)(MAC_BASE_ADDR + 0x08)))
 
 static inline void mac_clear(void) {
-    MAC_CONTROL = MAC_CTRL_CLEAR;
+    MAC_CLEAR = 0;
 }
 
 static inline void mac_accumulate(int8_t a, int8_t b) {
-    MAC_OPERAND_A = (uint32_t)(int32_t)a;
-    MAC_OPERAND_B = (uint32_t)(int32_t)b;
-    MAC_CONTROL   = MAC_CTRL_ACCUMULATE;
+    // pack {B, A} into one word: low byte = A, next byte = B
+    MAC_DO = (uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8);
 }
 
 static inline int32_t mac_read_result(void) {
@@ -81,7 +80,7 @@ static int32_t dot_product_sw(const int8_t *a, const int8_t *b, int n) {
 }
 
 // ---------------------------------------------------------------------------
-// HW: core writes operands to MAC unit, MAC unit does the computation
+// HW: core streams operand pairs to the MAC unit, MAC unit accumulates
 // ---------------------------------------------------------------------------
 static int32_t dot_product_hw(const int8_t *a, const int8_t *b, int n) {
     mac_clear();
