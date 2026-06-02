@@ -21,10 +21,22 @@ RISCV_LD      ?= $(RISCV_PREFIX)ld
 RISCV_STRIP   ?= $(RISCV_PREFIX)strip
 
 # Compiler and linker flags
+# -ffunction-sections/-fdata-sections + --gc-sections let the linker drop
+# unused functions/data per binary. print.c (printf), idma/gpio/clint/obi_timer
+# are linked into every elf but most tests only use uart -> without GC they
+# waste a big chunk of the 4K SRAM. With GC, each binary keeps only what it
+# actually references.
+#
+# ORIGINAL (pre-GC) lines, kept for reference / easy revert:
+#   RISCV_FLAGS ?= -march=$(RISCV_MARCH) -mabi=$(RISCV_MABI) -mcmodel=medany \
+#       -static -std=gnu99 -Os -nostdlib -fno-builtin -ffreestanding
+#   RISCV_LDFLAGS ?= -static -nostartfiles -lm -lgcc $(RISCV_FLAGS)
+# (i.e. drop "-ffunction-sections -fdata-sections" and "-Wl,--gc-sections" below)
 RISCV_FLAGS ?= -march=$(RISCV_MARCH) -mabi=$(RISCV_MABI) -mcmodel=medany \
-	-static -std=gnu99 -Os -nostdlib -fno-builtin -ffreestanding
+	-static -std=gnu99 -Os -nostdlib -fno-builtin -ffreestanding \
+	-ffunction-sections -fdata-sections
 RISCV_CCFLAGS ?= $(RISCV_FLAGS) -Iinclude -I$(INCDIR) -I$(CURDIR)
-RISCV_LDFLAGS ?= -static -nostartfiles -lm -lgcc $(RISCV_FLAGS)
+RISCV_LDFLAGS ?= -static -nostartfiles -lm -lgcc -Wl,--gc-sections $(RISCV_FLAGS)
 
 
 # Directory defaults
