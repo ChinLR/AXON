@@ -19,7 +19,11 @@
 #include "uart.h"
 
 static inline uint32_t read_mcycle(void) {
+#ifdef __riscv
     uint32_t v; asm volatile("csrr %0, mcycle" : "=r"(v)); return v;
+#else
+    return 0;  // host self-check build: no cycle counter
+#endif
 }
 static void print_str(const char *s) { while (*s) uart_write((uint8_t)*s++); }
 static void print_int(int32_t v) {
@@ -514,19 +518,67 @@ static void mlp_sw(void) {
     }
 }
 
+// --- HW path: original scalar mac_unit.sv (acc += A*B, one store per term) ---
+// Register map (user base 0x2000_0000): 0x00 MAC[W]{B,A}, 0x04 CLEAR[W],
+// 0x08 RESULT[R]. ReLU/requantize stay in SW. Device-only.
+#ifdef __riscv
+#define MAC_BASE_ADDR (0x20000000UL)
+#define MAC_DO     (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x00)))
+#define MAC_CLEAR  (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x04)))
+#define MAC_RESULT (*((volatile int32_t  *)(MAC_BASE_ADDR + 0x08)))
+static inline void    mac_clear(void)            { MAC_CLEAR = 0; }
+static inline void    mac_acc(int8_t a, int8_t b){ MAC_DO = (uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8); }
+static inline int32_t mac_result(void)           { return (int32_t)MAC_RESULT; }
+
+static int8_t h1_hw[H1], h2_hw[H2], y_hw[OUT];
+
+static void mlp_hw(void) {
+    for (int o = 0; o < H1; ++o) {
+        mac_clear();
+        for (int i = 0; i < IN; ++i) mac_acc(w1[o*IN+i], x_test[i]);
+        h1_hw[o] = relu_requant(mac_result(), SHIFT1);
+    }
+    for (int o = 0; o < H2; ++o) {
+        mac_clear();
+        for (int i = 0; i < H1; ++i) mac_acc(w2[o*H1+i], h1_hw[i]);
+        h2_hw[o] = relu_requant(mac_result(), SHIFT2);
+    }
+    for (int o = 0; o < OUT; ++o) {
+        mac_clear();
+        for (int i = 0; i < H2; ++i) mac_acc(w3[o*H2+i], h2_hw[i]);
+        y_hw[o] = sat_requant(mac_result(), SHIFT3);
+    }
+}
+#endif
+
 int main(void) {
     uart_init();
 
     uint32_t t0 = read_mcycle();
     mlp_sw();
-    uint32_t cyc = read_mcycle() - t0;
+    uint32_t cyc_sw = read_mcycle() - t0;
 
-    print_vec("y=",      y_out,  OUT);
+    print_vec("SW y=",   y_out,  OUT);
     print_vec("golden=", GOLDEN, OUT);
-    print_str("cyc="); print_int((int32_t)cyc); uart_write('\n');
+    print_str("SW cyc="); print_int((int32_t)cyc_sw); uart_write('\n');
 
     int pass = 1;
     for (int i = 0; i < OUT; ++i) if (y_out[i] != GOLDEN[i]) pass = 0;
+
+#ifdef __riscv
+    uint32_t t1 = read_mcycle();
+    mlp_hw();
+    uint32_t cyc_hw = read_mcycle() - t1;
+
+    print_vec("HW y=", y_hw, OUT);
+    print_str("HW cyc="); print_int((int32_t)cyc_hw); uart_write('\n');
+    for (int i = 0; i < OUT; ++i) if (y_hw[i] != GOLDEN[i]) pass = 0;
+
+    if (cyc_hw < cyc_sw) { print_str("MAC faster by "); print_int((int32_t)(cyc_sw - cyc_hw)); }
+    else                 { print_str("Core faster by "); print_int((int32_t)(cyc_hw - cyc_sw)); }
+    print_str(" cyc\n");
+#endif
+
     print_str(pass ? "PASS\n" : "FAIL\n");
 
     uart_write_flush();
