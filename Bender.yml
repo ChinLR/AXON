@@ -53,6 +53,7 @@ sources:
       # Level 3
       - rtl/croc_soc.sv
       - rtl/user_domain/mac_unit.sv
+      - rtl/user_domain/mac_unit2.sv
 
   - target: not(fpga)
     files:

@@ -518,36 +518,34 @@ static void mlp_sw(void) {
     }
 }
 
-// --- HW path: original scalar mac_unit.sv (acc += A*B, one store per term) ---
-// Register map (user base 0x2000_0000): 0x00 MAC[W]{B,A}, 0x04 CLEAR[W],
-// 0x08 RESULT[R]. ReLU/requantize stay in SW. Device-only.
+// --- HW path: SIMD-4 mac_unit2.sv (4-lane dot product, 4 MACs per MAC4 store) -
+// Register map (user base 0x2000_0000): 0x00 ACT[W] {a3,a2,a1,a0}, 0x04 MAC4[W]
+// {w3,w2,w1,w0} -> acc += sum(a*w), 0x08 CLEAR[W], 0x0C RESULT[R]. Activations
+// load resident; each MAC4 streams a weight quad. All layer dims are multiples
+// of 4, so each dot tiles into n/4 (ACT,MAC4) pairs. ReLU/requant stay in SW.
 #ifdef __riscv
-#define MAC_BASE_ADDR (0x20000000UL)
-#define MAC_DO     (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x00)))
-#define MAC_CLEAR  (*((volatile uint32_t *)(MAC_BASE_ADDR + 0x04)))
-#define MAC_RESULT (*((volatile int32_t  *)(MAC_BASE_ADDR + 0x08)))
-static inline void    mac_clear(void)            { MAC_CLEAR = 0; }
-static inline void    mac_acc(int8_t a, int8_t b){ MAC_DO = (uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8); }
-static inline int32_t mac_result(void)           { return (int32_t)MAC_RESULT; }
+#define MAC2_BASE   (0x20000000UL)
+#define MAC2_ACT    (*((volatile uint32_t *)(MAC2_BASE + 0x00)))
+#define MAC2_MAC4   (*((volatile uint32_t *)(MAC2_BASE + 0x04)))
+#define MAC2_CLEAR  (*((volatile uint32_t *)(MAC2_BASE + 0x08)))
+#define MAC2_RESULT (*((volatile int32_t  *)(MAC2_BASE + 0x0C)))
+static inline uint32_t pack4(const int8_t *p) {
+    return (uint32_t)(uint8_t)p[0]        | ((uint32_t)(uint8_t)p[1] << 8)
+         | ((uint32_t)(uint8_t)p[2] << 16) | ((uint32_t)(uint8_t)p[3] << 24);
+}
+// length-n (n % 4 == 0) dot product through the SIMD-4 engine
+static int32_t mac2_dot(const int8_t *a, const int8_t *w, int n) {
+    MAC2_CLEAR = 0;
+    for (int q = 0; q < n; q += 4) { MAC2_ACT = pack4(a + q); MAC2_MAC4 = pack4(w + q); }
+    return (int32_t)MAC2_RESULT;
+}
 
 static int8_t h1_hw[H1], h2_hw[H2], y_hw[OUT];
 
 static void mlp_hw(void) {
-    for (int o = 0; o < H1; ++o) {
-        mac_clear();
-        for (int i = 0; i < IN; ++i) mac_acc(w1[o*IN+i], x_test[i]);
-        h1_hw[o] = relu_requant(mac_result(), SHIFT1);
-    }
-    for (int o = 0; o < H2; ++o) {
-        mac_clear();
-        for (int i = 0; i < H1; ++i) mac_acc(w2[o*H1+i], h1_hw[i]);
-        h2_hw[o] = relu_requant(mac_result(), SHIFT2);
-    }
-    for (int o = 0; o < OUT; ++o) {
-        mac_clear();
-        for (int i = 0; i < H2; ++i) mac_acc(w3[o*H2+i], h2_hw[i]);
-        y_hw[o] = sat_requant(mac_result(), SHIFT3);
-    }
+    for (int o = 0; o < H1;  ++o) h1_hw[o] = relu_requant(mac2_dot(x_test, &w1[o*IN], IN), SHIFT1);
+    for (int o = 0; o < H2;  ++o) h2_hw[o] = relu_requant(mac2_dot(h1_hw, &w2[o*H1], H1), SHIFT2);
+    for (int o = 0; o < OUT; ++o) y_hw[o]  = sat_requant (mac2_dot(h2_hw, &w3[o*H2], H2), SHIFT3);
 }
 #endif
 

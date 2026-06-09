@@ -99,7 +99,8 @@ module user_domain import user_pkg::*; import croc_pkg::*; #(
   ///////////////////////////////////
   //         MAC Unit              //
   ///////////////////////////////////
-  mac_unit #(
+  // mac_unit2 = SIMD-4 dot-product engine (swap back to `mac_unit` for scalar)
+  mac_unit2 #(
     .ObiCfg    ( SbrObiCfg     ),
     .obi_req_t ( sbr_obi_req_t ),
     .obi_rsp_t ( sbr_obi_rsp_t )
