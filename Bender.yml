@@ -34,7 +34,7 @@ sources:
   - rtl/clint/clint_reg_pkg.sv
   - rtl/obi_timer/obi_timer_reg_pkg.sv
   # add your design files containing anything but modules (packages) here
-  - rtl/user_domain/mac_unit.sv
+
     # RTL
   - target: not(netlist_yosys)
     files:
